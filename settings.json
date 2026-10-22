@@ -1,0 +1,23 @@
+{
+  "allowedMaturity": ["minimal", "mild"],
+  "rotationHours": 6,
+  "trending": {
+    "poolSize": 12,
+    "count": 6,
+    "minVotes": 100,
+    "minLikePercent": 70
+  },
+  "hiddenGems": {
+    "minPlaying": 150,
+    "maxPlaying": 3000,
+    "minVotes": 500,
+    "minLikePercent": 85,
+    "maxDaysSinceUpdate": 30,
+    "poolSize": 20,
+    "count": 6
+  },
+  "communityPicks": [
+    { "universeId": 3626555083 }
+  ],
+  "blockedUniverseIds": []
+}
