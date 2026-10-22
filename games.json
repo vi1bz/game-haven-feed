@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-22T21:15:00Z",
+  "message": "Hello from GitHub! If you can read this in Studio, the web fetch works.",
+  "games": [
+    {
+      "id": "sample-1",
+      "name": "Sample Game One",
+      "category": "Trending",
+      "description": "Placeholder entry. Real games will appear once the data feed is connected.",
+      "isPlaceholder": true
+    },
+    {
+      "id": "sample-2",
+      "name": "Sample Game Two",
+      "category": "Hidden Gems",
+      "description": "Placeholder entry. Smaller, overlooked games will be featured here.",
+      "isPlaceholder": true
+    },
+    {
+      "id": "sample-3",
+      "name": "Sample Game Three",
+      "category": "Community Picks",
+      "description": "Placeholder entry. Player nominations will appear here later.",
+      "isPlaceholder": true
+    }
+  ]
+}
