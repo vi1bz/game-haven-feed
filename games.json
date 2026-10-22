@@ -5,7 +5,7 @@
   "games": [
     {
       "id": "sample-1",
-      "name": "Sample Game One",
+      "name": "Feed Test Game",
       "category": "Trending",
       "description": "Placeholder entry. Real games will appear once the data feed is connected.",
       "isPlaceholder": true
