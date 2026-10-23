@@ -16,8 +16,6 @@
     "poolSize": 20,
     "count": 6
   },
-  "communityPicks": [
-    { "universeId": 3626555083 }
-  ],
+    "communityPicks": [],
   "blockedUniverseIds": []
 }
