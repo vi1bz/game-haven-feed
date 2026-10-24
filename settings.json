@@ -1,9 +1,10 @@
 {
   "allowedMaturity": ["minimal", "mild"],
   "rotationHours": 6,
+  "cooldownHours": 48,
   "trending": {
-    "poolSize": 12,
-    "count": 6,
+    "poolSize": 40,
+    "count": 12,
     "minVotes": 100,
     "minLikePercent": 70
   },
@@ -13,8 +14,9 @@
     "minVotes": 500,
     "minLikePercent": 85,
     "maxDaysSinceUpdate": 30,
-    "poolSize": 20,
-    "count": 6
+    "maxVisits": 50000000,
+    "poolSize": 60,
+    "count": 12
   },
   "communityPicks": [],
   "blockedUniverseIds": []
