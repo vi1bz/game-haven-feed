@@ -18,6 +18,9 @@
     "poolSize": 60,
     "count": 12
   },
+  "pool": {
+    "maxGames": 240
+  },
   "communityPicks": [],
   "blockedUniverseIds": []
 }
