@@ -4,6 +4,10 @@
 Reads Roblox's public Charts data, filters it with the rules in settings.json,
 and writes games.json. Uses only Python's standard library and needs no keys.
 
+It also keeps a small memory file (state.json) so picks stay the same for one
+rotation period, then change, and so a game is not shown again until its
+cooldown has passed (unless the pool of games runs dry).
+
 If anything goes wrong the script exits with an error and leaves the existing
 games.json untouched, so the game keeps showing the last good data.
 """
@@ -22,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 SETTINGS_FILE = "settings.json"
 OUTPUT_FILE = "games.json"
+STATE_FILE = "state.json"
 EXPLORE_URL = (
     "https://apis.roblox.com/explore-api/v1/get-sorts"
     "?sessionId={session}&device=computer&country=all"
@@ -30,7 +35,6 @@ GAMES_URL = "https://games.roblox.com/v1/games?universeIds={ids}"
 VOTES_URL = "https://games.roblox.com/v1/games/votes?universeIds={ids}"
 USER_AGENT = "GameHavenFeed/1.0"
 BATCH_SIZE = 50
-SHORTLIST_SIZE = 40
 MAX_NAME = 60
 MAX_DESCRIPTION = 140
 MIN_VOTES_FOR_PERCENT = 20
@@ -40,15 +44,17 @@ EMOJI_PATTERN = re.compile("[\U00010000-\U0010ffff\u2190-\u2bff\ufe0f\u200d]")
 DEFAULTS = {
     "allowedMaturity": ["minimal", "mild"],
     "rotationHours": 6,
-    "trending": {"poolSize": 12, "count": 6, "minVotes": 100, "minLikePercent": 70},
+    "cooldownHours": 48,
+    "trending": {"poolSize": 40, "count": 12, "minVotes": 100, "minLikePercent": 70},
     "hiddenGems": {
         "minPlaying": 150,
         "maxPlaying": 3000,
         "minVotes": 500,
         "minLikePercent": 85,
         "maxDaysSinceUpdate": 30,
-        "poolSize": 20,
-        "count": 6,
+        "maxVisits": 50000000,
+        "poolSize": 60,
+        "count": 12,
     },
     "communityPicks": [],
     "blockedUniverseIds": [],
@@ -89,6 +95,8 @@ def load_settings():
 
     if not is_number(settings["rotationHours"]) or settings["rotationHours"] <= 0:
         raise ValueError("'rotationHours' must be a number above zero")
+    if not is_number(settings["cooldownHours"]) or settings["cooldownHours"] < 0:
+        raise ValueError("'cooldownHours' must be a number, zero or more")
 
     for section in ("trending", "hiddenGems"):
         for key, value in settings[section].items():
@@ -111,6 +119,84 @@ def load_settings():
         raise ValueError("'blockedUniverseIds' must be a list of whole numbers")
 
     return settings
+
+
+# ------------------------------------------------------------------ memory
+
+def empty_state():
+    return {"slot": None, "current": {}, "lastShown": {}}
+
+
+def load_state():
+    """Reads state.json. A missing or damaged file just means a fresh start."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return empty_state()
+    if not isinstance(data, dict):
+        return empty_state()
+
+    slot = data.get("slot") if isinstance(data.get("slot"), int) else None
+    current = {}
+    if isinstance(data.get("current"), dict):
+        for category, ids in data["current"].items():
+            if isinstance(category, str) and isinstance(ids, list):
+                current[category] = [i for i in ids if isinstance(i, int)]
+    last_shown = {}
+    if isinstance(data.get("lastShown"), dict):
+        for key, value in data["lastShown"].items():
+            if isinstance(key, str) and isinstance(value, int):
+                last_shown[key] = value
+    return {"slot": slot, "current": current, "lastShown": last_shown}
+
+
+def save_state(state):
+    temp_file = STATE_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temp_file, STATE_FILE)
+
+
+def pick_with_memory(category, pool, count, state, slot, cooldown_slots):
+    """Chooses 'count' games from 'pool' (a list of game dicts).
+
+    - Within one rotation period (slot) the earlier picks are kept, so the
+      boards do not change every 15 minutes.
+    - In a new slot, games shown within the cooldown are skipped, unless there
+      are not enough other games, in which case the longest-ago ones return.
+    """
+    by_id = {game["universeId"]: game for game in pool}
+    last_shown = state["lastShown"]
+
+    chosen_ids = []
+    if state["slot"] == slot:
+        for universe_id in state["current"].get(category, []):
+            if universe_id in by_id and universe_id not in chosen_ids:
+                chosen_ids.append(universe_id)
+        chosen_ids = chosen_ids[:count]
+
+    need = count - len(chosen_ids)
+    if need > 0:
+        remaining = [game["universeId"] for game in pool if game["universeId"] not in chosen_ids]
+
+        def recently_shown(universe_id):
+            last = last_shown.get(str(universe_id))
+            return last is not None and last < slot and slot - last < cooldown_slots
+
+        fresh = [uid for uid in remaining if not recently_shown(uid)]
+        stale = [uid for uid in remaining if recently_shown(uid)]
+
+        rng = random.Random(slot * 7919 + sum(ord(char) for char in category))
+        rng.shuffle(fresh)
+        picked = fresh[:need]
+        if len(picked) < need:
+            stale.sort(key=lambda uid: last_shown.get(str(uid), -1))
+            picked += stale[:need - len(picked)]
+        chosen_ids += picked
+
+    return [by_id[universe_id] for universe_id in chosen_ids]
 
 
 # ----------------------------------------------------------------- network
@@ -229,20 +315,9 @@ def parse_time(value):
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def rotate(candidates, count, salt, rotation_hours):
-    """Picks 'count' games. The pick stays the same within one rotation period
-    and changes when the next period starts."""
-    if len(candidates) <= count:
-        return list(candidates)
-    slot = int(time.time() // (rotation_hours * 3600))
-    rng = random.Random(slot * 31 + salt)
-    chosen = sorted(rng.sample(range(len(candidates)), count))
-    return [candidates[i] for i in chosen]
-
-
 def interleave(*lists):
-    """Trending, Hidden Gem, Community Pick, Trending, ... so the first three
-    games (your three displays) show one of each."""
+    """Trending, Hidden Gem, Community Pick, Trending, ... so a mixed layout
+    shows a bit of everything near the top."""
     result = []
     for index in range(max(len(items) for items in lists)):
         for items in lists:
@@ -267,6 +342,11 @@ def main():
     allowed_maturity = set(settings["allowedMaturity"])
     blocked = set(settings["blockedUniverseIds"])
     rotation_hours = settings["rotationHours"]
+    cooldown_slots = int(math.ceil(settings["cooldownHours"] / rotation_hours))
+    slot = int(time.time() // (rotation_hours * 3600))
+    state = load_state()
+    print(f"Rotation period #{slot} (cooldown {cooldown_slots} period(s)). "
+          f"Memory is from period #{state['slot']}.")
 
     sorts = read_explore()
     pool = {}
@@ -298,11 +378,12 @@ def main():
             trending_pool.append(game)
         if len(trending_pool) >= int(cfg["poolSize"]):
             break
-    trending = rotate(trending_pool, int(cfg["count"]), 1, rotation_hours)
+    trending = pick_with_memory("Trending", trending_pool, int(cfg["count"]),
+                                state, slot, cooldown_slots)
     print(f"Trending: {len(trending_pool)} qualified, picked {len(trending)}.")
 
     # --- Hidden Gems: our own rule over the same pool.
-    cfg = settings["hiddenGems"]
+    hcfg = settings["hiddenGems"]
     if "top-playing-now" not in sorts:
         print("WARNING: no 'top-playing-now' list, so top games are only excluded by player count.")
     top_playing = set()
@@ -316,35 +397,43 @@ def main():
         game for game in pool.values()
         if game["universeId"] not in trending_ids
         and game["universeId"] not in top_playing
-        and allowed(game, cfg["minVotes"])
-        and cfg["minPlaying"] <= game["playing"] <= cfg["maxPlaying"]
-        and like_ratio(game) * 100 >= cfg["minLikePercent"]
+        and allowed(game, hcfg["minVotes"])
+        and hcfg["minPlaying"] <= game["playing"] <= hcfg["maxPlaying"]
+        and like_ratio(game) * 100 >= hcfg["minLikePercent"]
     ]
     candidates.sort(key=lambda game: wilson_lower_bound(game["up"], game["down"]), reverse=True)
-    shortlist = candidates[:SHORTLIST_SIZE]
 
-    # --- Details for everything we might show.
+    # --- Details for everything we might show (batched).
     picks = settings["communityPicks"]
     pick_ids = [pick["universeId"] for pick in picks]
     wanted = []
     for universe_id in ([g["universeId"] for g in trending]
-                        + [g["universeId"] for g in shortlist] + pick_ids):
+                        + [g["universeId"] for g in candidates] + pick_ids):
         if universe_id not in wanted:
             wanted.append(universe_id)
     details = fetch_in_batches(GAMES_URL, wanted)
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=cfg["maxDaysSinceUpdate"])
+    cutoff = datetime.now(timezone.utc) - timedelta(days=hcfg["maxDaysSinceUpdate"])
+    max_visits = hcfg["maxVisits"]
     hidden_pool = []
-    for game in shortlist:
+    for game in candidates:
         info = details.get(game["universeId"])
-        updated = parse_time(info.get("updated")) if info else None
-        if updated and updated >= cutoff:
-            hidden_pool.append(game)
-        if len(hidden_pool) >= int(cfg["poolSize"]):
+        if not info:
+            continue
+        updated = parse_time(info.get("updated"))
+        if not updated or updated < cutoff:
+            continue
+        if max_visits > 0:
+            visits = info.get("visits")
+            if not isinstance(visits, int) or visits > max_visits:
+                continue
+        hidden_pool.append(game)
+        if len(hidden_pool) >= int(hcfg["poolSize"]):
             break
-    hidden = rotate(hidden_pool, int(cfg["count"]), 2, rotation_hours)
-    print(f"Hidden Gems: {len(candidates)} candidates, {len(shortlist)} shortlisted, "
-          f"{len(hidden_pool)} recently updated, picked {len(hidden)}.")
+    hidden = pick_with_memory("Hidden Gems", hidden_pool, int(hcfg["count"]),
+                              state, slot, cooldown_slots)
+    print(f"Hidden Gems: {len(candidates)} candidates, {len(hidden_pool)} after the "
+          f"update and visit filters, picked {len(hidden)}.")
 
     # --- Votes for community picks that are not in the Charts data.
     votes = {}
@@ -414,24 +503,41 @@ def main():
         raise RuntimeError("No games could be built. Leaving games.json unchanged.")
 
     for entry in games:
-        print(f"  [{entry['category']}] {entry['name']} - "
-              f"{entry.get('playing', '?')} playing, {entry.get('likePercent', '?')}% liked")
+        print(f"  [{entry['category']}] {entry['name']} - {entry.get('playing', '?')} playing, "
+              f"{entry.get('likePercent', '?')}% liked, {entry.get('visits', '?')} visits")
 
+    # --- Write games.json (only if it changed).
     if games == load_existing_games():
-        print("No changes since the last run.")
-        return
+        print("No changes to games.json since the last run.")
+    else:
+        payload = {
+            "schemaVersion": 1,
+            "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "games": games,
+        }
+        temp_file = OUTPUT_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(temp_file, OUTPUT_FILE)
+        print(f"Wrote {len(games)} game(s) to {OUTPUT_FILE}.")
 
-    payload = {
-        "schemaVersion": 1,
-        "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "games": games,
+    # --- Update the memory (after games.json, so a failure above changes nothing).
+    new_current = {
+        "Trending": [game["universeId"] for game in trending],
+        "Hidden Gems": [game["universeId"] for game in hidden],
     }
-    temp_file = OUTPUT_FILE + ".tmp"
-    with open(temp_file, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
-    os.replace(temp_file, OUTPUT_FILE)
-    print(f"Wrote {len(games)} game(s) to {OUTPUT_FILE}.")
+    new_last_shown = dict(state["lastShown"])
+    for ids in new_current.values():
+        for universe_id in ids:
+            new_last_shown[str(universe_id)] = slot
+    keep_periods = max(cooldown_slots * 4, 4)
+    new_last_shown = {key: value for key, value in new_last_shown.items()
+                      if slot - value <= keep_periods}
+    new_state = {"slot": slot, "current": new_current, "lastShown": new_last_shown}
+    if new_state != state:
+        save_state(new_state)
+        print("Saved state.json.")
 
 
 if __name__ == "__main__":
