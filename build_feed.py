@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Builds games.json for Game Haven by discovering games automatically.
+"""Builds games.json and pool.json for Game Haven by discovering games.
 
 Reads Roblox's public Charts data, filters it with the rules in settings.json,
-and writes games.json. Uses only Python's standard library and needs no keys.
+and writes:
+  - games.json: the games shown on the boards (Trending and Hidden Gems)
+  - pool.json:  a bigger list used by the find-my-game machine (about once an hour)
+Uses only Python's standard library and needs no keys.
 
-It also keeps a small memory file (state.json) so picks stay the same for one
-rotation period, then change, and so a game is not shown again until its
-cooldown has passed (unless the pool of games runs dry).
+It also keeps a small memory file (state.json) so board picks stay the same
+for one rotation period, then change, and so a game is not shown again until
+its cooldown has passed (unless the pool of games runs dry).
 
 If anything goes wrong the script exits with an error and leaves the existing
-games.json untouched, so the game keeps showing the last good data.
+games.json untouched, so the game keeps showing the last good data. A problem
+with pool.json only produces a warning and never blocks games.json.
 """
 
 import json
@@ -22,11 +26,13 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 SETTINGS_FILE = "settings.json"
 OUTPUT_FILE = "games.json"
 STATE_FILE = "state.json"
+POOL_FILE = "pool.json"
 EXPLORE_URL = (
     "https://apis.roblox.com/explore-api/v1/get-sorts"
     "?sessionId={session}&device=computer&country=all"
@@ -38,6 +44,7 @@ BATCH_SIZE = 50
 MAX_NAME = 60
 MAX_DESCRIPTION = 140
 MIN_VOTES_FOR_PERCENT = 20
+MIN_POOL_GAMES = 20
 VALID_MATURITY = ("minimal", "mild", "moderate")
 EMOJI_PATTERN = re.compile("[\U00010000-\U0010ffff\u2190-\u2bff\ufe0f\u200d]")
 
@@ -55,6 +62,15 @@ DEFAULTS = {
         "maxVisits": 50000000,
         "poolSize": 60,
         "count": 12,
+    },
+    "pool": {
+        "maxGames": 160,
+        "minPlaying": 50,
+        "minVotes": 100,
+        "minLikePercent": 75,
+        "hiddenMinPlaying": 50,
+        "hiddenMaxPlaying": 5000,
+        "refreshMinutes": 60,
     },
     "communityPicks": [],
     "blockedUniverseIds": [],
@@ -98,7 +114,7 @@ def load_settings():
     if not is_number(settings["cooldownHours"]) or settings["cooldownHours"] < 0:
         raise ValueError("'cooldownHours' must be a number, zero or more")
 
-    for section in ("trending", "hiddenGems"):
+    for section in ("trending", "hiddenGems", "pool"):
         for key, value in settings[section].items():
             if not is_number(value) or value < 0:
                 raise ValueError(f"'{section}.{key}' must be a number, zero or more")
@@ -334,6 +350,26 @@ def load_existing_games():
         return None
 
 
+def write_json(path, payload):
+    temp_file = path + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    os.replace(temp_file, path)
+
+
+def pool_is_due(refresh_minutes):
+    """True if pool.json is missing or older than the refresh time."""
+    try:
+        with open(POOL_FILE, "r", encoding="utf-8") as handle:
+            generated = parse_time(json.load(handle).get("generatedAt"))
+    except (OSError, ValueError, AttributeError):
+        return True
+    if generated is None:
+        return True
+    return datetime.now(timezone.utc) - generated >= timedelta(minutes=refresh_minutes)
+
+
 # -------------------------------------------------------------------- main
 
 def main():
@@ -403,12 +439,38 @@ def main():
     ]
     candidates.sort(key=lambda game: wilson_lower_bound(game["up"], game["down"]), reverse=True)
 
+    # --- Games for the find-my-game pool (rebuilt about once an hour).
+    pcfg = settings["pool"]
+    pool_due = pool_is_due(pcfg["refreshMinutes"])
+    pool_candidate_ids = []
+    if pool_due:
+        hidden_first = [
+            game for game in pool.values()
+            if allowed(game, hcfg["minVotes"])
+            and pcfg["hiddenMinPlaying"] <= game["playing"] <= pcfg["hiddenMaxPlaying"]
+            and like_ratio(game) * 100 >= hcfg["minLikePercent"]
+        ]
+        hidden_first.sort(key=lambda game: wilson_lower_bound(game["up"], game["down"]), reverse=True)
+        others = [
+            game for game in pool.values()
+            if allowed(game, pcfg["minVotes"])
+            and game["playing"] >= pcfg["minPlaying"]
+            and like_ratio(game) * 100 >= pcfg["minLikePercent"]
+        ]
+        others.sort(key=lambda game: wilson_lower_bound(game["up"], game["down"]), reverse=True)
+        for game in hidden_first + others[:int(pcfg["maxGames"])]:
+            if game["universeId"] not in pool_candidate_ids:
+                pool_candidate_ids.append(game["universeId"])
+    else:
+        print(f"Pool is fresh (under {int(pcfg['refreshMinutes'])} minutes old). Skipping it this run.")
+
     # --- Details for everything we might show (batched).
     picks = settings["communityPicks"]
     pick_ids = [pick["universeId"] for pick in picks]
     wanted = []
     for universe_id in ([g["universeId"] for g in trending]
-                        + [g["universeId"] for g in candidates] + pick_ids):
+                        + [g["universeId"] for g in candidates]
+                        + pick_ids + pool_candidate_ids):
         if universe_id not in wanted:
             wanted.append(universe_id)
     details = fetch_in_batches(GAMES_URL, wanted)
@@ -510,16 +572,11 @@ def main():
     if games == load_existing_games():
         print("No changes to games.json since the last run.")
     else:
-        payload = {
+        write_json(OUTPUT_FILE, {
             "schemaVersion": 1,
             "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "games": games,
-        }
-        temp_file = OUTPUT_FILE + ".tmp"
-        with open(temp_file, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-            handle.write("\n")
-        os.replace(temp_file, OUTPUT_FILE)
+        })
         print(f"Wrote {len(games)} game(s) to {OUTPUT_FILE}.")
 
     # --- Update the memory (after games.json, so a failure above changes nothing).
@@ -538,6 +595,79 @@ def main():
     if new_state != state:
         save_state(new_state)
         print("Saved state.json.")
+
+    # --- Write pool.json for the find-my-game machine.
+    # A problem here is only a warning: it must never block games.json.
+    if pool_due:
+        try:
+            friends_ids = set()
+            for raw in sorts.get("fun-with-friends", []):
+                game = normalize(raw)
+                if game:
+                    friends_ids.add(game["universeId"])
+            if "fun-with-friends" not in sorts:
+                print("WARNING: no 'fun-with-friends' list, so no game is marked as good with friends.")
+
+            entries = []
+            for universe_id in pool_candidate_ids:
+                if len(entries) >= int(pcfg["maxGames"]):
+                    break
+                game = pool.get(universe_id)
+                info = details.get(universe_id)
+                if not game or not info or not isinstance(info.get("name"), str):
+                    continue
+                place_id = info.get("rootPlaceId")
+                if not isinstance(place_id, int):
+                    continue
+                name = shorten(clean_name(info["name"]) or strip_emoji(info["name"]), MAX_NAME)
+                if not name:
+                    continue
+
+                visits = info.get("visits")
+                updated = parse_time(info.get("updated"))
+                is_hidden = (
+                    pcfg["hiddenMinPlaying"] <= game["playing"] <= pcfg["hiddenMaxPlaying"]
+                    and game["up"] + game["down"] >= hcfg["minVotes"]
+                    and like_ratio(game) * 100 >= hcfg["minLikePercent"]
+                    and updated is not None and updated >= cutoff
+                    and (max_visits <= 0 or (isinstance(visits, int) and visits <= max_visits))
+                    and universe_id not in top_playing
+                )
+                creator = info.get("creator") if isinstance(info.get("creator"), dict) else {}
+                entry = {
+                    "universeId": universe_id,
+                    "rootPlaceId": place_id,
+                    "name": name,
+                    "genre": info.get("genre_l1") or info.get("genre"),
+                    "subgenre": info.get("genre_l2"),
+                    "playing": info.get("playing"),
+                    "visits": visits,
+                    "likePercent": round(like_ratio(game) * 100),
+                    "creatorName": creator.get("name"),
+                    "tier": "hidden" if is_hidden else "popular",
+                    "friends": universe_id in friends_ids,
+                    "trending": universe_id in trending_ids,
+                    "maturity": game["maturity"],
+                    "lastUpdated": info.get("updated"),
+                }
+                entries.append({key: value for key, value in entry.items() if value is not None})
+
+            if len(entries) < MIN_POOL_GAMES:
+                raise RuntimeError(f"only {len(entries)} usable games, so pool.json was not updated")
+
+            write_json(POOL_FILE, {
+                "schemaVersion": 1,
+                "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "games": entries,
+            })
+            tiers = Counter(entry["tier"] for entry in entries)
+            genres = Counter(entry.get("genre", "?") for entry in entries).most_common(8)
+            friend_count = sum(1 for entry in entries if entry["friends"])
+            print(f"Pool: wrote {len(entries)} games ({tiers.get('hidden', 0)} hidden, "
+                  f"{tiers.get('popular', 0)} popular, {friend_count} good with friends).")
+            print("Pool top genres: " + ", ".join(f"{name} {count}" for name, count in genres))
+        except Exception as error:  # noqa: BLE001 - never block games.json
+            print(f"WARNING: could not update {POOL_FILE}. {error}")
 
 
 if __name__ == "__main__":
