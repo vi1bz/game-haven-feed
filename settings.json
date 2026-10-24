@@ -10,7 +10,7 @@
   },
   "hiddenGems": {
     "minPlaying": 150,
-    "maxPlaying": 3000,
+    "maxPlaying": 5000,
     "minVotes": 500,
     "minLikePercent": 85,
     "maxDaysSinceUpdate": 30,
